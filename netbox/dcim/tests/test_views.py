@@ -5437,6 +5437,87 @@ class CableTestCase(
             [(1, interfaces[1]), (2, interfaces[0])]
         )
 
+    def _get_cable_edit_data(self, cable, **kwargs):
+        return {
+            'a_terminations': [obj.pk for obj in cable.a_terminations],
+            'b_terminations': [obj.pk for obj in cable.b_terminations],
+            'type': cable.type,
+            'status': cable.status,
+            **kwargs,
+        }
+
+    @tag('regression')  # Issue #23357
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'], EXEMPT_EXCLUDE_MODELS=[])
+    def test_edit_with_unchanged_terminations_retains_paths(self):
+        """
+        Submitting the edit form with a cable's existing terminations must keep its CablePaths and leave the
+        endpoints' path assignments untouched.
+        """
+        self.add_permissions('dcim.change_cable')
+        cable = Interface.objects.get(device__name='Device 1', device__site__slug='site-1', name='Interface 1').cable
+        path_pks = set(CablePath.objects.filter(_nodes__contains=cable).values_list('pk', flat=True))
+        endpoint_paths = dict(Interface.objects.filter(cable=cable).values_list('pk', '_path_id'))
+        self.assertEqual(len(path_pks), 2)
+
+        response = self.client.post(
+            self._get_url('edit', cable),
+            data=post_data(self._get_cable_edit_data(cable, label='Edited'))
+        )
+
+        self.assertHttpStatus(response, 302)
+        self.assertEqual(Cable.objects.get(pk=cable.pk).label, 'Edited')
+        self.assertSetEqual(
+            set(CablePath.objects.filter(_nodes__contains=cable).values_list('pk', flat=True)),
+            path_pks
+        )
+        self.assertDictEqual(
+            dict(Interface.objects.filter(cable=cable).values_list('pk', '_path_id')),
+            endpoint_paths
+        )
+
+    @tag('regression')  # Issue #23357
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'], EXEMPT_EXCLUDE_MODELS=[])
+    def test_edit_with_unchanged_terminations_applies_status_change(self):
+        """
+        A status change submitted alongside unchanged terminations must still update the cable's paths.
+        """
+        self.add_permissions('dcim.change_cable')
+        cable = Interface.objects.get(device__name='Device 1', device__site__slug='site-1', name='Interface 2').cable
+
+        response = self.client.post(
+            self._get_url('edit', cable),
+            data=post_data(self._get_cable_edit_data(cable, status=LinkStatusChoices.STATUS_PLANNED))
+        )
+
+        self.assertHttpStatus(response, 302)
+        paths = CablePath.objects.filter(_nodes__contains=cable)
+        self.assertEqual(paths.count(), 2)
+        self.assertFalse(any(path.is_active for path in paths))
+
+    @tag('regression')  # Issue #23357
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'], EXEMPT_EXCLUDE_MODELS=[])
+    def test_edit_with_changed_terminations_rebuilds_paths(self):
+        """
+        Replacing a termination via the edit form must detach the old endpoint and trace a path for the new one.
+        """
+        self.add_permissions('dcim.change_cable')
+        cable = Interface.objects.get(device__name='Device 1', device__site__slug='site-1', name='Interface 3').cable
+        old_interface = cable.b_terminations[0]
+        new_interface = Interface.objects.get(name='Device 2 Interface')
+
+        response = self.client.post(
+            self._get_url('edit', cable),
+            data=post_data(self._get_cable_edit_data(cable, b_terminations=[new_interface.pk]))
+        )
+
+        self.assertHttpStatus(response, 302)
+        old_interface.refresh_from_db()
+        self.assertIsNone(old_interface.cable)
+        self.assertIsNone(old_interface._path_id)
+        new_interface.refresh_from_db()
+        self.assertEqual(new_interface.cable, cable)
+        self.assertTrue(new_interface._path.is_complete)
+
 
 #
 # Connections

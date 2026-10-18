@@ -142,8 +142,14 @@ def get_cable_form(a_type, b_type):
         def clean(self):
             super().clean()
 
-            # Set the A/B terminations on the Cable instance
-            self.instance.a_terminations = self.cleaned_data.get('a_terminations', [])
-            self.instance.b_terminations = self.cleaned_data.get('b_terminations', [])
+            # Set the A/B terminations on the Cable instance. Skip an end whose submitted terminations match its
+            # initial selection, since assigning them would needlessly rebuild the Cable's paths. Compare as sets, as
+            # the selection's ordering is not significant.
+            for field_name in ('a_terminations', 'b_terminations'):
+                terminations = self.cleaned_data.get(field_name, [])
+                initial = self.initial.get(field_name)
+                if self.instance.pk and initial is not None and set(terminations) == set(initial):
+                    continue
+                setattr(self.instance, field_name, terminations)
 
     return _CableForm
