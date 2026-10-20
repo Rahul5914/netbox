@@ -57,6 +57,16 @@ class CableSerializer(PrimaryModelSerializer):
         ]
         brief_fields = ('id', 'url', 'display', 'label', 'description')
 
+    def validate(self, data):
+        # Omit any termination list which matches the Cable's current terminations, since assigning it would
+        # needlessly rebuild the Cable's paths. Compare in order, as list order determines connector assignment.
+        if self.instance is not None and not self.nested:
+            for field_name in ('a_terminations', 'b_terminations'):
+                if field_name in data and data[field_name] == getattr(self.instance, field_name):
+                    del data[field_name]
+
+        return super().validate(data)
+
 
 class TracedCableSerializer(BaseModelSerializer):
     """

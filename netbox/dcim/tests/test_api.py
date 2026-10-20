@@ -5663,6 +5663,148 @@ class CableTestCase(APIViewTestCases.APIViewTestCase):
                 self.assertEqual(kept.cable, cable)
                 self.assertFalse(kept._path.is_complete)
 
+    @tag('regression')  # Issue #23357
+    def test_unchanged_terminations_retain_paths(self):
+        """
+        A PUT or PATCH which resubmits a cable's existing terminations must keep its CablePaths and leave the
+        endpoints' path assignments untouched.
+        """
+        self.add_permissions('dcim.change_cable')
+        cable = Cable.objects.get(label='Cable 1')
+        interface_a = Interface.objects.get(cable=cable, cable_end=CableEndChoices.SIDE_A)
+        interface_b = Interface.objects.get(cable=cable, cable_end=CableEndChoices.SIDE_B)
+        terminations = {
+            'a_terminations': [{'object_type': 'dcim.interface', 'object_id': interface_a.pk}],
+            'b_terminations': [{'object_type': 'dcim.interface', 'object_id': interface_b.pk}],
+        }
+        path_pks = set(CablePath.objects.filter(_nodes__contains=cable).values_list('pk', flat=True))
+        endpoint_paths = dict(Interface.objects.filter(cable=cable).values_list('pk', '_path_id'))
+        self.assertEqual(len(path_pks), 2)
+
+        for method, data in (
+            ('put', {'status': cable.status, **terminations, 'label': 'Cable 1 (PUT)'}),
+            ('patch', {**terminations, 'label': 'Cable 1 (PATCH)'}),
+            ('patch', {'a_terminations': terminations['a_terminations']}),
+        ):
+            with self.subTest(method=method, fields=sorted(data)):
+                response = getattr(self.client, method)(
+                    self._get_detail_url(cable), data, format='json', **self.header
+                )
+
+                self.assertHttpStatus(response, status.HTTP_200_OK)
+                self.assertSetEqual(
+                    set(CablePath.objects.filter(_nodes__contains=cable).values_list('pk', flat=True)),
+                    path_pks
+                )
+                self.assertDictEqual(
+                    dict(Interface.objects.filter(cable=cable).values_list('pk', '_path_id')),
+                    endpoint_paths
+                )
+
+    @tag('regression')  # Issue #23357
+    def test_reordered_terminations_reassign_connectors(self):
+        """
+        Termination order is significant via the API, since it determines connector assignment: resubmitting the
+        same terminations in a different order must rewire the cable.
+        """
+        self.add_permissions('dcim.change_cable')
+        interfaces = Interface.objects.filter(device__name='Device 1', name__in=('eth7', 'eth8')).order_by('name')
+        peers = Interface.objects.filter(device__name='Device 2', name__in=('eth7', 'eth8')).order_by('name')
+        cable = Cable(
+            a_terminations=list(interfaces),
+            b_terminations=list(peers),
+            profile=CableProfileChoices.TRUNK_2C1P,
+        )
+        cable.save()
+
+        response = self.client.patch(
+            self._get_detail_url(cable),
+            {
+                'a_terminations': [
+                    {'object_type': 'dcim.interface', 'object_id': interfaces[1].pk},
+                    {'object_type': 'dcim.interface', 'object_id': interfaces[0].pk},
+                ],
+            },
+            format='json',
+            **self.header
+        )
+
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(
+            [
+                (ct.connector, ct.termination)
+                for ct in CableTermination.objects.filter(
+                    cable=cable, cable_end=CableEndChoices.SIDE_A
+                ).order_by('connector')
+            ],
+            [(1, interfaces[1]), (2, interfaces[0])]
+        )
+
+    @tag('regression')  # Issue #23357
+    def test_unchanged_terminations_apply_status_and_profile_changes(self):
+        """
+        Resubmitting unchanged terminations alongside a new status or profile must still apply that change to the
+        cable's paths and terminations.
+        """
+        self.add_permissions('dcim.change_cable')
+        cable = Cable.objects.get(label='Cable 2')
+        interface_a = Interface.objects.get(cable=cable, cable_end=CableEndChoices.SIDE_A)
+        interface_b = Interface.objects.get(cable=cable, cable_end=CableEndChoices.SIDE_B)
+        terminations = {
+            'a_terminations': [{'object_type': 'dcim.interface', 'object_id': interface_a.pk}],
+            'b_terminations': [{'object_type': 'dcim.interface', 'object_id': interface_b.pk}],
+        }
+
+        # Status change
+        response = self.client.patch(
+            self._get_detail_url(cable),
+            {**terminations, 'status': LinkStatusChoices.STATUS_PLANNED},
+            format='json',
+            **self.header
+        )
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        paths = CablePath.objects.filter(_nodes__contains=cable)
+        self.assertEqual(paths.count(), 2)
+        self.assertFalse(any(path.is_active for path in paths))
+
+        # Profile change
+        response = self.client.patch(
+            self._get_detail_url(cable),
+            {**terminations, 'profile': CableProfileChoices.SINGLE_1C1P},
+            format='json',
+            **self.header
+        )
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(
+            sorted(CableTermination.objects.filter(cable=cable).values_list('cable_end', 'connector')),
+            [(CableEndChoices.SIDE_A, 1), (CableEndChoices.SIDE_B, 1)]
+        )
+
+    @tag('regression')  # Issue #23357
+    def test_changed_terminations_rebuild_paths(self):
+        """
+        Replacing a cable's termination via the API must detach the old endpoint and trace a path for the new one.
+        """
+        self.add_permissions('dcim.change_cable')
+        cable = Cable.objects.get(label='Cable 3')
+        old_interface = Interface.objects.get(cable=cable, cable_end=CableEndChoices.SIDE_B)
+        new_interface = Interface.objects.get(device__name='Device 2', name='eth9')
+
+        response = self.client.patch(
+            self._get_detail_url(cable),
+            {'b_terminations': [{'object_type': 'dcim.interface', 'object_id': new_interface.pk}]},
+            format='json',
+            **self.header
+        )
+
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        old_interface.refresh_from_db()
+        self.assertIsNone(old_interface.cable)
+        self.assertIsNone(old_interface._path_id)
+        new_interface.refresh_from_db()
+        self.assertEqual(new_interface.cable, cable)
+        self.assertTrue(new_interface._path.is_complete)
+
     def test_graphql_cable_termination_cached_filters(self):
         """
         Validate filtering cables by cached CableTermination relations via GraphQL:
